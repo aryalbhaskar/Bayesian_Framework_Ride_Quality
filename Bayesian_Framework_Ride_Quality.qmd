@@ -1,0 +1,767 @@
+---
+title: "A Bayesian Framework to Predict and Evaluate Ride Quality of a Row Crop Planter  "
+author: "Bhaskar Aryal, Srijana Subedi"
+format: pdf
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+### Import Modules
+
+This section loads all the libraries we will be using for our analysis
+
+```{r}
+library(car)
+library(MASS)
+library(ggplot2)
+library(viridis)
+library(mvtnorm)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(ggjoy)
+library(ggridges)
+```
+
+### Importing and Exploring data set
+
+Data is exported from a csv file using read.csv
+
+```{r}
+# Import and explore data set 
+
+#setwd("C:/Users/bhaskar/OneDrive - Kansas State University/Documents/KSU 2022/MS BAE/Semester III - Jan 23 - May 23/STAT 768 - Applied Bayesian/Project/Codes")
+
+setwd("C:/Users/aryal/OneDrive - Kansas State University/Documents/KSU 2022/MS BAE/Semester III - Jan 23 - May 23/STAT 768 - Applied Bayesian/Project/Codes")
+
+df <- read.csv("JD_RQuality.csv", header = TRUE)
+
+# inspect the data
+head(df)
+str(df)
+
+# mutate the dataframe 
+
+df <- df %>%
+  mutate(EC = factor(EC, levels = c("Low", "Medium", "High"))) %>%
+  dplyr::select(Speed, GW.Force, Downforce, Dual.EM.150.CM, EC, Ride.Quality)
+  
+View(df)  
+dplyr::glimpse(df)
+skimr::skim(df)
+
+```
+
+Check if the data set has missing or NA values
+
+```{r}
+# Check for missing and NA values 
+
+sum(is.na(df))
+
+```
+
+Splitting the data set into test and train subsets
+
+```{r}
+# check dimension of data 
+dim(df)
+
+# Set the seed for reproducibility
+set.seed(1)
+
+# Split the data into training and testing sets
+n <- nrow(df)
+trainIndex <- sample(seq_len(n), size = round(0.6 * n), replace = FALSE)
+train.df <- df[trainIndex, ]
+test.df <- df[-trainIndex, ]
+
+```
+
+### Preliminary steps
+
+Set values to variables, write out the model and design matrix 
+
+```{r}
+# Arguments for algorithm
+
+n = dim(train.df)[1] # number of observations 
+
+y = train.df$Ride.Quality # response variable
+
+# Design Matrix 
+X <- model.matrix(Ride.Quality ~ Speed + Downforce + EC + Speed:EC +
+                    Downforce:EC, data = train.df)
+
+# alternatively defining the model matrix 
+#X = cbind(rep(1, n), as.matrix(train.df[, 1:p]))
+
+p = dim(X)[2] # dimension of parameters
+
+```
+
+#### Write down the MCMC algorithm for Bayesian Linear Regression
+
+MCMC algorithm function 
+
+```{r}
+# MCMC algorithm
+
+norm.reg.mcmc <- function(y, X, beta.mn, beta.var, s2.mn, s2.sd, n.mcmc){
+  
+  ##subroutines # library(mvtnorm) to generate multivariate random samples 
+  
+library(mvtnorm)
+  
+# Full conditional Distribution for sigma.2 in the multiple linear regression 
+  
+# Reference page 92 BBML
+
+# Define a function to generate r and q 
+# r and q are parameters of the inverse gamma distribution
+# r corresponds to shape and q corresponds to scale
+# used to sample posterior of variance parameter in the Bayesian model 
+  
+invgammastrt <- function(igmn, igvar){
+    q <- 2 + (igmn^2)/igvar
+    r <- 1 / (igmn * (q-1))
+    list(r = r, q = q)
+}        
+
+n <- dim(X)[1]
+p <- dim(X)[2]
+  
+r <- invgammastrt(s2.mn, s2.sd^2)$r
+q <- invgammastrt(s2.mn, s2.sd^2)$q
+  
+Sig.beta.inv = diag(1/beta.var, p)     # inverse of covariance matrix
+
+# Initialize the matrix to save MCMC outputs 
+
+beta.save <- matrix(0, n.mcmc, p)
+
+s2.save <- matrix(0, n.mcmc, 1)
+
+# starting value for betas
+
+beta <- solve(t(X)%*%X)%*%t(X)%*%y 
+
+# MCMC Loop 
+
+for (k in 1:n.mcmc) {
+    
+    #Sample S2
+
+tmp.r <- (1/r + 0.5*t(y-X%*%beta)%*%(y-X%*%beta))^(-1)
+tmp.q <- n/2+q 
+s2 <- 1/rgamma(1,tmp.q,,tmp.r)
+    
+    
+    #Sample Beta
+    
+tmp.var <- solve(t(X)%*%X/s2 + Sig.beta.inv)
+tmp.mn <- tmp.var%*%(t(X)%*%y/s2 + Sig.beta.inv%*%beta.mn)
+
+beta <- (rmvnorm(1, tmp.mn, tmp.var, method = 'chol'))
+beta <- t(beta)    
+    
+    # save samples 
+    
+beta.save[k, ] <- beta
+s2.save[k] <- s2
+
+
+}
+
+# Write output
+
+list(beta.save = beta.save, s2.save = s2.save, y = y, X = X, n.mcmc = n.mcmc,
+       n=n, r = r, q = q, p= p)
+}
+
+```
+
+Call the function with priors and number of iterations 
+
+```{r function_call}
+
+# Call the MCMC algorithm function 
+
+set.seed(6455)
+
+mcmc.out=norm.reg.mcmc(y=y,X=X,beta.mn=rep(0,p),beta.var=10000,
+    s2.mn=1,s2.sd=10,n.mcmc=10000) # uses non informative priors for betas
+
+```
+
+save the output 
+
+```{r}
+# Save the output of the function as data frame 
+
+samples.beta <- as.data.frame(mcmc.out$beta.save)
+samples.sigma2 <- as.data.frame(mcmc.out$s2.save)
+
+samples <- as.data.frame(c(samples.beta, samples.sigma2))
+colnames(samples) <- c(colnames(X), "sigma2")
+
+```
+
+### Trace plots
+
+```{r}
+# Define burn in interval 
+burn.in <- 1000
+```
+
+```{r}
+
+#par(cex.lab=1.5, cex.axis=1.25,cex.main=1.5,mar=c(5,5,2,1))
+#layout(matrix(1:10,5,2))
+
+for (i in 1:9) {
+  plot(samples[,i], type="l", lty=1, lwd = 0.5, col = "black",
+       xlab = "Iterations (k)", ylab = bquote(beta[.(i-1)])
+, main = letters[i])
+  
+  # Add a mean value and burn in interval 
+  abline(h = mean(samples[, i]), lty = 2, lwd = 1.5, col = "red")
+  abline(v = burn.in, lty = 2, lwd = 1.5, col = "gold")
+  
+  # Add legend 
+  legend("topright", legend = c("Average", "Burn-in Period"), lty = 2,
+         col = c("red", "gold"), 
+       box.lwd = 0.1, cex = 0.75)
+}
+
+# sigma2
+plot(samples[,10], type="l", lty=1, lwd = 0.5, col = "black",
+       xlab = "Iterations (k)", ylab = expression(sigma^2),
+     main = letters[i])
+  
+  # Add a mean value and burn in interval 
+  abline(h = mean(samples[, 10]), lty = 2, lwd = 1.5, col = "red")
+  abline(v = burn.in, lty = 2, lwd = 1.5, col = "gold")
+  
+  # Add legend 
+  legend("topright", legend = c("Average", "Burn-in Period"), lty = 2,
+         col = c("red", "gold"), 
+       box.lwd = 0.1, cex = 0.75)
+
+```
+
+### Trace plots
+
+```{r, eval=FALSE}
+# Individual trace plots - clean up later 
+
+plot(mcmc.out$beta.save[,1],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[0])) # intercept
+plot(mcmc.out$beta.save[,2],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[1])) # speed
+plot(mcmc.out$beta.save[,3],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[2])) # Downforce
+plot(mcmc.out$beta.save[,4],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[3])) # EC Medium 
+plot(mcmc.out$beta.save[,5],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[4])) # EC High 
+plot(mcmc.out$beta.save[,6],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[5])) # Speed:Medium 
+plot(mcmc.out$beta.save[,7],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[6])) # Speed:ECHigh 
+plot(mcmc.out$beta.save[,8],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[7])) # Downforce:ECMedium
+plot(mcmc.out$beta.save[,9],type="l",lty=1,
+     xlab = "Iterations (k)", ylab = bquote(beta[8])) # Downforce:ECHigh
+
+#sigma
+plot(mcmc.out$s2.save,type="l", lty =1,
+     xlab = "Iterations (k)", ylab = bquote(sigma^2)) # sigma
+
+```
+
+### Posterior Histograms Inverse gamma density function
+
+```{r}
+# Define the Density function 
+
+dIG <- function(x, igmn, igvar){
+  q <- 2 + (igmn^2)/igvar
+  r <- 1/(igmn*(q-1))
+  x ^(q-1) * exp(-1/r/x) / (r^q) / gamma(q) # Reference BBML
+}
+
+```
+
+### Plottng the posteriors
+
+```{r}
+#pdf("myplot1.pdf")
+#par(cex.lab=1.5, cex.axis=1.25, cex.main=1.5, mar=c(5,5,4,2))
+#layout(matrix(1:10, 2,5))
+
+for (i in 1:9) {
+  hist(samples[-c(1:burn.in), i], 
+       xlab = bquote(beta[.(i-1)] ~ "|" ~ bold(y)), 
+       ylab = bquote("[" ~ beta[.(i-1)] ~ "|" ~ bold(y) ~ "]"), 
+       freq = FALSE, col = "lightgrey", main = letters[i], breaks = 50)
+  curve(dnorm(x, 0, 10000), lwd = 2, add = TRUE, col = "black")
+  abline(v = quantile(samples[-c(1:burn.in), i], c(0.025, 0.50, 0.975)),
+         lwd = 0.75, col = "navy", lty =2)
+}
+
+# sigma2
+hist(samples[-c(1:burn.in),10],xlab=expression(sigma^2*"|"*bold(y)),
+     ylab=expression("["*sigma^2*"|"*bold(y)*"]"),freq=FALSE,col="lightgrey",
+     main="m",breaks=50)
+curve(dIG(x,50,1000),lwd=2,add=TRUE, col= "black")
+abline(v = quantile(samples[-c(1:burn.in), 10], c(0.025, 0.50, 0.975)),
+       lwd = 0.75, col = "navy", lty = 2)
+#dev.off()
+```
+
+### Quantiles
+
+```{r}
+# Quantile / credible intervals 
+
+quantile(mcmc.out$beta.save[,1],c(0.025, 0.50, 0.75, 0.975)) # intercept 
+quantile(mcmc.out$beta.save[,2],c(0.025, 0.50, 0.75, 0.975)) # Speed 
+quantile(mcmc.out$beta.save[,3],c(0.025, 0.50, 0.75, 0.975)) # Downforce   
+quantile(mcmc.out$beta.save[,4],c(0.025, 0.50, 0.75, 0.975)) # EC Medium 
+quantile(mcmc.out$beta.save[,5],c(0.025, 0.50, 0.75, 0.975)) # EC High 
+quantile(mcmc.out$beta.save[,6],c(0.025, 0.50, 0.75, 0.975)) # Speed:ECMedium 
+quantile(mcmc.out$beta.save[,7],c(0.025, 0.50, 0.75, 0.975)) # Speed:ECHigh 
+quantile(mcmc.out$beta.save[,8],c(0.025, 0.50, 0.75, 0.975)) # Downforce:ECMedium 
+quantile(mcmc.out$beta.save[,9],c(0.025, 0.50, 0.75, 0.975)) # Downforce:ECHigh 
+
+quantile(mcmc.out$s2.save,c(0.025, 0.50, 0.75, 0.975)) # sigma 
+
+```
+
+### Posterior Mean and SD
+
+```{r}
+
+# Posterior Mean 
+
+mean(mcmc.out$beta.save[,1])
+mean(mcmc.out$beta.save[,2]) # Speed 
+mean(mcmc.out$beta.save[,3]) # Downforce   
+mean(mcmc.out$beta.save[,4]) # EC Medium 
+mean(mcmc.out$beta.save[,5]) # EC High 
+mean(mcmc.out$beta.save[,6]) # Speed:ECMedium 
+mean(mcmc.out$beta.save[,7]) # Speed:ECHigh 
+mean(mcmc.out$beta.save[,8]) # Downforce:ECMedium 
+mean(mcmc.out$beta.save[,9]) # Downforce:ECHigh 
+
+mean(mcmc.out$s2.save) # sigma 
+
+
+## Posterior SD
+
+sd(mcmc.out$beta.save[,1])
+sd(mcmc.out$beta.save[,2]) # Speed 
+sd(mcmc.out$beta.save[,3]) # Downforce   
+sd(mcmc.out$beta.save[,4]) # EC Medium 
+sd(mcmc.out$beta.save[,5]) # EC High 
+sd(mcmc.out$beta.save[,6]) # Speed:ECMedium 
+sd(mcmc.out$beta.save[,7]) # Speed:ECHigh 
+sd(mcmc.out$beta.save[,8]) # Downforce:ECMedium 
+sd(mcmc.out$beta.save[,9]) # Downforce:ECHigh 
+
+sd(mcmc.out$s2.save) # sigma 
+
+```
+
+Make predictions at user defined covariate levels 
+
+```{r}
+# Prediction and user specification 
+
+new_df <- data.frame(Speed = 7.5, Downforce = 120, EC = "Low")
+new_df$EC <- factor(new_df$EC, levels = c("Low", "Medium", "High"))
+
+X_new_df <- model.matrix( ~ Speed + Downforce + EC +
+                       Speed:EC + Downforce:EC,
+                     data = new_df)
+
+# Making predictions 
+
+ppd.samples <- rnorm(10000, X_new_df%*%t(samples.beta), sqrt(samples$sigma2))
+
+
+
+# 95 % equal-tailed credible interval
+CI <- quantile(ppd.samples[-c(1:burn.in)],prob=c(0.025,0.975))
+
+# Histogram of samples from the posterior predictive distribution
+hist(ppd.samples[-c(1:burn.in)],xlab=expression(tilde(y)*"|"*bold(y)),
+  ylab=expression("["*tilde(y)*"|"*bold(y)*"]"),
+  freq=FALSE,col="lightgrey",main="",breaks=50)
+abline(v = mean(ppd.samples), col = "red", lwd = 2.5, lty = 'dashed')
+abline(v = CI[1], col = "navy", lwd = 2.5, lty = 'dashed')
+abline(v = CI[2], col = "navy", lwd = 2.5, lty = 'dashed')
+text(x = 65, y = 0.04, labels = paste("RQ =", round(mean(ppd.samples),2)),
+     col = "black", cex = 1.5)
+
+
+```
+
+Predicttions continued...
+
+```{r}
+
+# Make predictions at different EC levels
+Speed <- seq(4, 12, 1)
+Downforce <- seq(100, 375, 50)
+EC <- factor(c("Low", "Medium", "High"))
+
+# Create an empty data frame to store predictions
+predictions_df <- data.frame(Speed = numeric(), Downforce = numeric(), 
+                             EC = factor(), Prediction = numeric())
+
+for (s in Speed) {
+  for (d in Downforce) {
+    for (ec in EC) {
+      new_df <- data.frame(Speed = s, Downforce = d, EC = factor(ec,
+                                      levels = c("Low", "Medium", "High")))
+      
+      X_design <- model.matrix( ~ Speed + Downforce + EC +
+                                 Speed:EC + Downforce:EC,
+                               data = new_df)
+      
+      # Generate predictions
+      predictions <- rnorm(10000, X_design %*% t(samples.beta),
+                           sqrt(samples$sigma2))
+      
+      # Add predictions to the data frame
+      predictions_df <- rbind(predictions_df, data.frame(Speed = s,
+                                                    Downforce = d, 
+                                          EC = ec, Prediction = predictions))
+    }
+  }
+}
+
+# Print the first few rows of the predictions data frame
+
+predictions_df$EC <- factor(predictions_df$EC,
+                            levels = c("Low", "Medium", "High"))
+head(predictions_df)
+
+```
+
+```{r}
+
+## make a data subset 
+
+subset_df <- predictions_df[(predictions_df$Speed %in% c(5, 7, 10, 12)) & (predictions_df$Downforce %in% c(100, 175, 250, 300, 350)), ]
+head(subset_df)
+
+```
+
+### Predictions visualizations - Speed and Ride Quality
+
+```{r}
+
+# Plot Ride Quality against ground speed 
+
+ggplot(data = subset_df, aes(x = Prediction, fill = as.factor(Speed))) + 
+  geom_density(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "GnBu", name = "Speed (Mph)", direction = 1) +
+  labs(x = "Predicted Ride Quality", y = "Density") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5))
+
+# Alternative visualization 
+
+ggplot(subset_df, aes(x = Prediction, y = as.factor(Speed),
+                      fill = as.factor(Speed))) + 
+  geom_density_ridges(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "GnBu", name = "Speed (Mph)", direction = 1) +
+  labs(x = "Predicted Ride Quality", y = "Speed") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5))
+
+```
+
+### Predictions visualizations - Downforce and Ride Quality
+
+```{r}
+
+# Plot Ride Quality against ground speed 
+
+ggplot(data = subset_df, aes(x = Prediction, fill = as.factor(Downforce))) + 
+  geom_density(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "Purples", name = "Downforce (lbf)",
+                    direction = 1) +
+  labs(x = "Predicted Ride Quality", y = "Density") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.5, "lines"))
+
+# Alternative visualization 
+
+ggplot(subset_df, aes(x = Prediction, y = as.factor(Downforce),
+                      fill = as.factor(Downforce))) + 
+  geom_density_ridges(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "Purples", name = "Downforce (lbf)",
+                    direction = 1) +
+  labs(x = "Predicted Ride Quality", y = "Downforce") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5))
+
+```
+
+### Predictions visualizations - EC and Ride Quality
+
+```{r}
+
+# Plot Ride Quality against EC 
+
+ggplot(data = subset_df, aes(x = Prediction, fill = as.factor(EC))) + 
+  geom_density(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "Blues", name = "Soil EC", direction = 1) +
+  labs(x = "Predicted Ride Quality", y = "Density") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.5, "lines"))
+
+# Alternative visualization 
+
+ggplot(subset_df, aes(x = Prediction, y = as.factor(EC), fill = as.factor(EC))) + 
+  geom_density_ridges(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "Blues", name = "Soil EC", direction = 1) +
+  labs(x = "Predicted Ride Quality", y = "Soil EC") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5))
+
+```
+
+### Plot the interaction of Soil EC and Ground Speed
+
+```{r}
+
+# calculate means for each group
+means <- aggregate(Prediction ~ Speed + EC, data = subset_df, FUN = mean)
+
+# plot density with vertical lines
+ggplot(subset_df, aes(x = Prediction, fill = as.factor(Speed))) + 
+  geom_density(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "GnBu", name = "Speed (Mph)", direction = 1) +
+  labs(x = "Prediction", y = "Density") +
+  facet_wrap(EC~., ncol = 1, nrow = 3, scales = "free_x") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  geom_vline(data = means, aes(xintercept = Prediction, 
+                               color = as.factor(Speed)), linetype = "dashed",
+             size = 0.75, show.legend = FALSE)
+
+# Alternative visualization with density ridges 
+
+# Speed and EC  
+ggplot(subset_df, aes(x = Prediction, y = as.factor(Speed),
+                      fill = as.factor(Speed))) + 
+  geom_density_ridges(alpha = 2.25, size = 0.75,) + 
+  scale_fill_brewer(palette = "GnBu", name = "Speed (Mph)", direction = -1) +
+  labs(x = "Predicted Ride Quality", y = "Speed") +
+  facet_wrap(EC~., ncol = 1, nrow = 3, scales = "free_x") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  geom_vline(data = means, aes(xintercept = Prediction,
+                               color = as.factor(Speed)), linetype = "dashed",
+             size = 1, show.legend = FALSE) 
+
+```
+
+### Plot the interaction of Soil EC and Downforce
+
+```{r}
+
+# calculate means for each group
+means <- aggregate(Prediction ~ Downforce + EC, data = subset_df, FUN = mean)
+
+# plot density with vertical lines
+ggplot(subset_df, aes(x = Prediction, fill = as.factor(Downforce))) + 
+  geom_density(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "Purples", name = "Downforce (lbf)",
+                    direction = 1) +
+  labs(x = "Prediction", y = "Density") +
+  facet_wrap(EC~., ncol = 1, nrow = 3, scales = "free_x") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  geom_vline(data = means, aes(xintercept = Prediction,
+                               color = as.factor(Downforce)),
+             linetype = "dashed",
+             size = 0.75, show.legend = FALSE) 
+
+# Alternative visualization 
+
+# Downforce and EC 
+ggplot(subset_df, aes(x = Prediction, y = as.factor(Downforce),
+                      fill = as.factor(Downforce))) + 
+  geom_density_ridges(alpha = 2.25, size = 0.75) + 
+  scale_fill_brewer(palette = "Purples", name = "Downforce (lbf)",
+                    direction = 1) +
+  labs(x = "Prediction", y = "Downforce") +
+  facet_wrap(EC~., ncol = 1, nrow = 3, scales = "free_x") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.1, "lines")) + 
+  geom_vline(data = means, aes(xintercept = Prediction,
+                               color = as.factor(Downforce)),
+             linetype = "dashed",
+             size = 0.75, show.legend = FALSE)
+
+
+```
+
+### Posterior prediction with test data and model performance
+
+```{r}
+
+# Predictive posterior distributions with new data
+
+# Design matrix for the test data
+Xnew <- model.matrix(Ride.Quality ~ Speed + Downforce + EC +
+                       Speed:EC + Downforce:EC,
+                     data = test.df)
+
+
+# Calculate the mean and variance of the predictive posterior distribution for each observation in the test data
+
+pred.mean <- apply(Xnew, 1, function(x) mean(x %*% t(samples.beta)))
+
+hist(pred.mean,xlab=expression(tilde(y)*"|"*bold(y)),
+  ylab=expression("["*tilde(y)*"|"*bold(y)*"]"),
+  freq=FALSE,col="lightgrey",main="",breaks=50)
+
+
+```
+
+### Plotting the predicted values from the test data
+
+```{r}
+# Create data frame with prediction in the test data set 
+
+test.df$pred.mean <- pred.mean
+
+# ggplot prediction - speed and Ride Quality  
+
+ggplot(test.df, aes(x = Speed, y = pred.mean)) +
+  geom_point(color = "black", fill = "darkred", shape = 21, size = 3.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "gold") +
+  labs(x = "Speed", y = "Ride Quality - Predicted (%)") + 
+  theme_bw()
+
+# Downforce and Ride Quality 
+
+ggplot(test.df, aes(x = Downforce , y = pred.mean)) +
+  geom_point(color = "black", fill = "darkred", shape = 21, size = 3.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "gold") +
+  labs(x = "Downforce", y = "Ride Quality - Predicted (%)") + 
+  theme_bw()
+
+
+ggplot(test.df, aes(x = EC, y = pred.mean, fill = EC)) +
+  labs(x = "EC", y = "Ride Quality - Predicted") + 
+  theme_bw() + geom_violin(aes(fill = EC)) + 
+  scale_fill_viridis(discrete = TRUE)
+
+```
+
+```{r}
+### clarify about this line 
+pred.var <- apply(Xnew, 1, function(x) var(x %*% t(samples.beta) + samples.beta))
+
+hist(pred.var,xlab=expression(sigma^2*"|y"),ylab=expression("["*sigma^2*"|y]"),
+     freq=FALSE,col="lightgrey",main="",breaks=100,
+     xlim = c(-0.1, 0.1))
+
+```
+
+### Sum of square residuals
+
+```{r}
+
+# prediction accuracy 
+
+sum((test.df$Ride.Quality - test.df$pred.mean)^2)/length(test.df$Ride.Quality)
+
+# MSE histogram 
+
+error <- test.df$Ride.Quality - test.df$pred.mean
+hist(error, breaks = 50, freq = FALSE, xlab = "Residual Error", ylab = "Density", main = "", ylim = c(0, 0.08))
+
+```
+
+### MSE Histogram
+
+```{r}
+# mse histogram 
+
+mse <- ((test.df$Ride.Quality - test.df$pred.mean)^2)/length(test.df$Ride.Quality)
+hist(mse, breaks = 50, freq = FALSE, xlab = "MSE", xlim = c(0, 0.020), main = "")
+
+mean(((test.df$Ride.Quality - test.df$pred.mean)^2)/length(test.df$Ride.Quality))
+quantile((((test.df$Ride.Quality - test.df$pred.mean)^2)/length(test.df$Ride.Quality)), 0.75)
+
+```
+
+### MAD value
+
+```{r}
+library(Metrics)
+
+# calculate MAD
+mad_value <- mad(test.df$pred.mean, test.df$Ride.Quality)
+cat("MAD:", mad_value, "\n")
+
+# calculate MAPE
+mape_value <- mape(test.df$Ride.Quality, test.df$pred.mean)
+cat("MAPE:", mape_value, "%\n")
+
+```
+
+```{r}
+
+# calculate means for each group
+means <- aggregate(Prediction ~ Speed + EC, data = subset_df, FUN = mean)
+
+# Speed and EC  
+ggplot(subset_df, aes(x = Prediction, y = as.factor(Speed), fill = as.factor(Speed))) + 
+ geom_density_ridges(alpha = 2.25, size = 0.50, stat = "binline", bins = 50, draw_baseline = TRUE) +
+  scale_fill_brewer(palette = "GnBu", name = "Speed (Mph)", direction = -1) +
+  labs(x = "Predicted Ride Quality", y = "Speed") +
+  facet_wrap(EC~., ncol = 1, nrow = 3, scales = "free_x") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.5, "lines")) +
+  geom_vline(data = means, aes(xintercept = Prediction, color = as.factor(Speed)), linetype = "dashed",
+             size = 1, show.legend = FALSE) 
+
+```
+
+```{r}
+
+# calculate means for each group
+means <- aggregate(Prediction ~ Downforce + EC, data = subset_df, FUN = mean)
+
+# Alternative visualization 
+
+# Downforce and EC 
+ggplot(subset_df, aes(x = Prediction, y = as.factor(Downforce), fill = as.factor(Downforce))) + 
+  geom_density_ridges(alpha = 2.25, size = 0.50, stat = "binline", bins = 50, draw_baseline = TRUE) + 
+  scale_fill_brewer(palette = "Purples", name = "Downforce (lbf)", direction = 1) +
+  labs(x = "Prediction", y = "Downforce") +
+  facet_wrap(EC~., ncol = 1, nrow = 3, scales = "free_x") +
+  theme_bw() + theme(legend.position = "bottom") +
+  scale_x_continuous(limits = c(50, 100), breaks = seq(0, 100, by = 5)) +
+  theme(panel.spacing.y = unit(0.1, "lines")) + 
+  geom_vline(data = means, aes(xintercept = Prediction, color = as.factor(Downforce)), linetype = "dashed",
+             size = 0.75, show.legend = FALSE)
+```
